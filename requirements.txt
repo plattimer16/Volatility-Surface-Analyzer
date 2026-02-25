@@ -1,0 +1,10 @@
+# Core scientific stack
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+
+# Options data
+yfinance>=0.2.50
+
+# Plotting
+matplotlib>=3.8
