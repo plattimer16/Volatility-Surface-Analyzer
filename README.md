@@ -3,7 +3,6 @@
 Builds the implied volatility surface of SPY options from the option chain, and
 checks it against no-arbitrage rather than against how plausible the plot looks.
 
-## The first version had a bug, and the bug turned out to be the interesting part
 
 The first surface I built showed same-strike puts near 30 vol and calls near 14.
 That is not a market observation. Put-call parity says a European call and put at
@@ -13,10 +12,8 @@ the same strike and expiry are tied together by
 C - P = e^(-rT) (F - K)
 ```
 
-so if both are priced off the same forward they must return the *same* implied
-volatility. Two contracts differing by 15 vol points at one strike are not an
-opportunity, they are an error by whoever computed them. It was mine, and there
-were two causes.
+so if both are priced off the same forward they must return the same implied
+volatility. As the saying goes, there is no free lunch. There were two causes:
 
 **No dividend yield, so the wrong forward.** The pricer used spot directly, which
 is the assumption `q = 0`. SPY yields about 1.1%, so the model's effective forward
@@ -26,7 +23,6 @@ pointing the same way as real skew, which is exactly why it looked believable.
 **Comparing in-the-money puts against out-of-the-money calls.** The smile plot
 overlaid every call and every put across the whole strike range. A deep ITM put
 and an OTM call at the same strike are not two observations of one volatility.
-They are one strike quoted twice, once on the wide side of the book.
 
 The fix was to stop guessing the forward and read it off the market, per expiry,
 from parity itself, at the strike where `|C - P|` is smallest:
@@ -48,10 +44,7 @@ strikes.
 
 ## How much of it was actually the dividend
 
-Worth being precise, because "I forgot the dividend yield" is the wrong lesson to
-take from it.
-
-The 30-versus-14 headline was mostly **not** a parity violation at all. It
+The 30-versus-14 result was not really a parity violation. It
 compared an average over deep in-the-money puts against an average over
 near-the-money calls: two different regions of moneyness, so most of the
 difference was a composition artifact. At *matched* strikes the gap was 2.50 vol
