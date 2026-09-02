@@ -1,80 +1,104 @@
 """
-Download and clean SPY options chain data from Yahoo Finance.
+Download and clean the SPY options chain from Yahoo Finance.
 
-Fetches all available expirations, filters out illiquid contracts, adds
-derived columns (mid-price, moneyness, DTE), and saves the result to CSV
-in data/processed/.
+The raw chain is written to data/raw/ before anything is filtered, so a filter
+sweep is a pure function of a saved file rather than something that needs a
+fresh fetch into a different market. That is what makes the robustness
+comparison in visualization.py mean anything.
 
-Pipeline
---------
-1. fetch_options_chain  — pull raw calls + puts for every listed expiry
-2. clean_options_data   — filter by spread / volume, compute helper columns
-3. save_to_csv          — write timestamped CSV to data/processed/
+    python src/data_collection.py                     fetch, save raw, clean
+    python src/data_collection.py --from-raw <path>    re-clean a saved chain
 """
 
 import os
+import sys
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
-# ---------------------------------------------------------------------------
-# Configuration — change these to fetch a different ticker or relax filters
-# ---------------------------------------------------------------------------
+from forward import (DEFAULT_RATE, add_forward_columns, forward_curve,
+                     infer_snapshot)
 
 TICKER = "SPY"
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+RAW_DIR = os.path.join(_SRC_DIR, "..", "data", "raw")
+OUTPUT_DIR = os.path.join(_SRC_DIR, "..", "data", "processed")
 
-# Contracts with a bid-ask spread wider than this are too illiquid to trust;
-# the mid-price would be far from the true fair value.
-MAX_BID_ASK_SPREAD = 0.50  # dollars
+# Relative, not absolute. A $0.50 cap keeps a penny option quoted 0.01/0.06,
+# which is 600% wide, and throws away an ATM contract quoted 21.85/21.95 the
+# moment the absolute spread clears fifty cents.
+MAX_REL_SPREAD = 0.10
 
-# Very low-volume contracts often have stale or crossed quotes.
-MIN_VOLUME = 10
+# One tick, and only one tick. A contract quoted 0.05/0.06 cannot be tighter
+# than this and should not be punished for it; a contract quoted 0.01/0.06 is
+# five ticks wide and is exactly what the relative test is here to remove.
+MIN_ABS_SPREAD = 0.01
+
+# Options worth less than a dime carry no usable volatility information: vega
+# has collapsed, so the mid rounds to the same price across a wide range of
+# sigma. On SPY this only removes the sub-2-delta tail.
+MIN_MID_PRICE = 0.10
+
+# Open interest, not volume. Volume is a flow and reads near zero early in the
+# session; open interest is a stock and does not care what time it is.
+MIN_OPEN_INTEREST = 100
+
+MIN_DTE, MAX_DTE = 7, 365
+
+OUTPUT_COLUMNS = [
+    "snapshot_ts",
+    "underlying_price",
+    "expiration",
+    "days_to_expiration",
+    "T",
+    "strike",
+    "moneyness",
+    "forward",
+    "log_moneyness",
+    "is_otm",
+    "option_type",
+    "bid",
+    "ask",
+    "mid_price",
+    "bid_ask_spread",
+    "rel_spread",
+    "volume",
+    "openInterest",
+    "impliedVolatility",
+]
 
 
 def fetch_options_chain(ticker: str) -> pd.DataFrame:
-    """Fetch the full options chain for all available expirations.
+    """Pull raw calls and puts for every listed expiry.
 
-    Iterates over every listed expiry, downloads calls and puts, tags each row
-    with the expiration date, option type, and the current spot price, then
-    concatenates everything into a single DataFrame.
-
-    Parameters
-    ----------
-    ticker : str
-        Equity ticker symbol (e.g. ``'SPY'``).
-
-    Returns
-    -------
-    pd.DataFrame
-        Raw options data — one row per contract, with yfinance default columns
-        plus ``expiration``, ``option_type``, and ``underlying_price``.
+    Returns one row per contract with the yfinance columns plus
+    ``expiration``, ``option_type``, ``underlying_price`` and ``snapshot_ts``.
+    Nothing is filtered here.
     """
-    stock = yf.Ticker(ticker)
+    import yfinance as yf
 
-    # yfinance returns a tuple of 'YYYY-MM-DD' strings, one per listed expiry
+    stock = yf.Ticker(ticker)
     expirations = stock.options
 
-    # Prefer regularMarketPrice; fall back to fast_info for after-hours quotes
     underlying_price = (
         stock.info.get("regularMarketPrice") or stock.fast_info["lastPrice"]
     )
+    snapshot_ts = pd.Timestamp.now(tz="America/New_York")
 
     print(f"Underlying price: ${underlying_price:.2f}")
+    print(f"Snapshot: {snapshot_ts:%Y-%m-%d %H:%M:%S %Z}")
     print(f"Found {len(expirations)} expiration dates")
 
     frames = []
     for exp in expirations:
-        chain = stock.option_chain(exp)  # returns (calls, puts) namedtuple
-
+        chain = stock.option_chain(exp)
         for option_type, df in [("call", chain.calls), ("put", chain.puts)]:
             df = df.copy()
-            # Attach metadata columns so rows stay self-contained after concat
             df["expiration"] = exp
             df["option_type"] = option_type
             df["underlying_price"] = underlying_price
+            df["snapshot_ts"] = snapshot_ts
             frames.append(df)
 
     raw = pd.concat(frames, ignore_index=True)
@@ -82,132 +106,132 @@ def fetch_options_chain(ticker: str) -> pd.DataFrame:
     return raw
 
 
-def clean_options_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Filter and clean raw options data, adding derived columns.
+def save_raw(df: pd.DataFrame, ticker: str) -> str:
+    """Write the unfiltered chain to data/raw/."""
+    os.makedirs(RAW_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(RAW_DIR, f"{ticker.lower()}_chain_{timestamp}.csv")
+    df.to_csv(path, index=False)
+    print(f"Saved {len(df)} raw rows to {path}")
+    return path
 
-    Derived columns added
-    ---------------------
-    ``mid_price``          : (bid + ask) / 2 — used as the market price for IV solving
-    ``bid_ask_spread``     : ask − bid — proxy for liquidity/transaction cost
-    ``days_to_expiration`` : calendar days until expiry from today
-    ``moneyness``          : K / S — normalised measure of how far from ATM a strike is
 
-    Filters applied
-    ---------------
-    - Bid-ask spread ≤ MAX_BID_ASK_SPREAD  (remove illiquid contracts)
-    - Volume ≥ MIN_VOLUME                  (remove stale/orphaned quotes)
-    - Bid > 0 and ask > 0                  (remove crossed / zero quotes)
-    - days_to_expiration > 0               (remove already-expired contracts)
+def clean_options_data(
+    df: pd.DataFrame,
+    *,
+    max_rel_spread: float = MAX_REL_SPREAD,
+    min_abs_spread: float = MIN_ABS_SPREAD,
+    min_mid_price: float = MIN_MID_PRICE,
+    min_oi: int = MIN_OPEN_INTEREST,
+    dte_range: tuple = (MIN_DTE, MAX_DTE),
+    r: float = DEFAULT_RATE,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Filter the raw chain and attach forward-relative columns.
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw output of :func:`fetch_options_chain`.
+    The thresholds are arguments rather than constants so the filter-robustness
+    comparison can sweep them without editing this file.
 
-    Returns
-    -------
-    pd.DataFrame
-        Cleaned DataFrame with a curated set of columns, sorted by
-        (DTE, option_type, strike).
+    The forward curve is built from the two-sided-quote frame *before* the
+    liquidity mask is applied. Put-call parity needs the near-ATM call and put
+    together and a spread filter will happily delete one leg of that pair; on
+    the Feb 2026 snapshot the old absolute-spread filter destroyed the ATM pair
+    at 6 of 31 expiries. Computed upstream the forward is a property of the
+    market, computed downstream it becomes a property of the filter settings.
     """
     df = df.copy()
 
-    # --- Derived price columns ---
     df["mid_price"] = (df["bid"] + df["ask"]) / 2
     df["bid_ask_spread"] = df["ask"] - df["bid"]
+    df["rel_spread"] = np.where(
+        df["mid_price"] > 0, df["bid_ask_spread"] / df["mid_price"], np.inf
+    )
 
-    # --- Time to expiration ---
     df["expiration_dt"] = pd.to_datetime(df["expiration"])
-    # Normalise to midnight so partial-day differences don't bleed between dates
-    df["days_to_expiration"] = (
-        df["expiration_dt"] - pd.Timestamp.now().normalize()
-    ).dt.days
+    snapshot = infer_snapshot(df)
+    if snapshot is None:
+        snapshot = pd.Timestamp.now()
+    df["snapshot_ts"] = snapshot
+    ref = pd.Timestamp(snapshot).tz_localize(None) if pd.Timestamp(snapshot).tz else pd.Timestamp(snapshot)
+    df["days_to_expiration"] = (df["expiration_dt"] - ref.normalize()).dt.days
 
-    # --- Normalised strike (K/S) ---
-    # Moneyness = 1.0 means exactly ATM, < 1.0 is OTM for a call, > 1.0 is ITM
     df["moneyness"] = df["strike"] / df["underlying_price"]
 
-    # --- Liquidity and validity filters ---
-    mask = (
-        (df["bid_ask_spread"] <= MAX_BID_ASK_SPREAD)  # wide spreads → unreliable mid
-        & (df["volume"] >= MIN_VOLUME)                 # thin volume → stale quotes
-        & (df["bid"] > 0)                              # crossed / zero quotes
-        & (df["ask"] > 0)
-        & (df["days_to_expiration"] > 0)               # skip already-expired rows
-    )
-    cleaned = df.loc[mask].copy()
+    # Two-sided live quotes are required before anything else: parity needs a
+    # real price on both legs, and a mid built off a zero bid is not a price.
+    quoted = df.loc[(df["bid"] > 0) & (df["ask"] > 0)].copy()
 
-    # Keep only the columns we'll actually use downstream
-    cols = [
-        "underlying_price",
-        "expiration",
-        "days_to_expiration",
-        "strike",
-        "moneyness",
-        "option_type",
-        "bid",
-        "ask",
-        "mid_price",
-        "bid_ask_spread",
-        "volume",
-        "openInterest",
-        "impliedVolatility",   # Yahoo's own IV estimate — useful as a sanity check
-    ]
+    spot = float(df["underlying_price"].iloc[0])
+    curve = forward_curve(quoted, spot, r=r, snapshot_ts=snapshot)
+
+    lo, hi = dte_range
+    mask = (
+        ((quoted["rel_spread"] <= max_rel_spread)
+         | (quoted["bid_ask_spread"] <= min_abs_spread))
+        & (quoted["mid_price"] >= min_mid_price)
+        & (quoted["openInterest"] >= min_oi)
+        & (quoted["days_to_expiration"] >= lo)
+        & (quoted["days_to_expiration"] <= hi)
+    )
+    cleaned = quoted.loc[mask].copy()
+    cleaned = add_forward_columns(cleaned, curve)
+
+    cols = [c for c in OUTPUT_COLUMNS if c in cleaned.columns]
     cleaned = (
         cleaned[cols]
         .sort_values(["days_to_expiration", "option_type", "strike"])
         .reset_index(drop=True)
     )
 
-    print(f"Contracts after cleaning: {len(cleaned)}")
+    if verbose:
+        print(f"Two-sided quotes: {len(quoted)} of {len(df)}")
+        print(f"Contracts after cleaning: {len(cleaned)}")
+        n_parity = int((curve["source"] == "parity").sum())
+        print(f"Forward curve: {n_parity}/{len(curve)} expiries from parity, "
+              f"carry r-q = {curve.attrs['fitted_carry']:.4f} "
+              f"(implied q = {r - curve.attrs['fitted_carry']:.4f})")
+
+    cleaned.attrs["forward_curve"] = curve
     return cleaned
 
 
 def save_to_csv(df: pd.DataFrame, ticker: str) -> str:
-    """Save the cleaned DataFrame to a timestamped CSV file.
-
-    The timestamp in the filename lets you accumulate multiple daily snapshots
-    in data/processed/ and always know which file is most recent.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Cleaned options data.
-    ticker : str
-        Ticker symbol used as the filename prefix.
-
-    Returns
-    -------
-    str
-        Absolute path of the saved file.
-    """
+    """Write the cleaned frame to a timestamped CSV in data/processed/."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{ticker.lower()}_options_{timestamp}.csv"
-    path = os.path.join(OUTPUT_DIR, filename)
+    path = os.path.join(OUTPUT_DIR, f"{ticker.lower()}_options_{timestamp}.csv")
     df.to_csv(path, index=False)
     print(f"Saved {len(df)} rows to {path}")
     return path
 
 
 def main():
-    """Orchestrate the full download → clean → save pipeline."""
-    print(f"Fetching options data for {TICKER}...")
-    raw = fetch_options_chain(TICKER)
+    from_raw = None
+    if "--from-raw" in sys.argv:
+        from_raw = sys.argv[sys.argv.index("--from-raw") + 1]
+
+    if from_raw:
+        print(f"Re-cleaning saved chain {from_raw}")
+        raw = pd.read_csv(from_raw)
+    else:
+        print(f"Fetching options data for {TICKER}...")
+        raw = fetch_options_chain(TICKER)
+        save_raw(raw, TICKER)
+
     cleaned = clean_options_data(raw)
 
     if cleaned.empty:
         print("No contracts passed the filters. Try relaxing thresholds.")
         return
 
-    # Quick summary so you can sanity-check the download at a glance
     print("\n--- Summary ---")
     print(f"Expirations: {cleaned['expiration'].nunique()}")
     print(f"Strikes:     {cleaned['strike'].nunique()}")
     print(f"Calls:       {(cleaned['option_type'] == 'call').sum()}")
     print(f"Puts:        {(cleaned['option_type'] == 'put').sum()}")
+    print(f"OTM:         {cleaned['is_otm'].sum()}")
     print(
-        f"DTE range:   {cleaned['days_to_expiration'].min()} – "
+        f"DTE range:   {cleaned['days_to_expiration'].min()} - "
         f"{cleaned['days_to_expiration'].max()} days"
     )
 
